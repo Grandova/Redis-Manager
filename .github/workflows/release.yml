@@ -1,0 +1,107 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Multi-Arch Binaries
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [linux]
+        goarch: [amd64, arm64]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Prepare Frontend Assets
+        run: |
+          if [ ! -f "internal/web/dist/index.html" ]; then
+            cd frontend
+            npm install
+            npm run build
+            cd ..
+          else
+            echo "Using pre-built embedded frontend assets in internal/web/dist"
+          fi
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          check-latest: true
+
+      - name: Build Binary (${{ matrix.goos }}/${{ matrix.goarch }})
+        env:
+          CGO_ENABLED: 0
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+          VERSION=${TAG_NAME#v}
+          if [ -z "$VERSION" ] || [ "$VERSION" = "$GITHUB_REF" ]; then
+            VERSION="1.0.0"
+          fi
+          go build -ldflags "-s -w -X main.Version=${VERSION}" -o redis-manager ./cmd/redis-manager
+          cp redis-manager redis-manager-${{ matrix.goos }}-${{ matrix.goarch }}
+          tar -czf redis-manager-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz redis-manager
+          sha256sum redis-manager-${{ matrix.goos }}-${{ matrix.goarch }} > redis-manager-${{ matrix.goos }}-${{ matrix.goarch }}.sha256
+          sha256sum redis-manager-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz >> redis-manager-${{ matrix.goos }}-${{ matrix.goarch }}.sha256
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            redis-manager-${{ matrix.goos }}-${{ matrix.goarch }}
+            redis-manager-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
+            redis-manager-${{ matrix.goos }}-${{ matrix.goarch }}.sha256
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Aggregate Checksums and Prepare Release Files
+        run: |
+          mkdir -p release-assets
+          find artifacts/ -type f -name "redis-manager-*" -exec cp {} release-assets/ \;
+          find artifacts/ -name "*.sha256" -exec cat {} + > release-assets/checksums.txt
+          cp scripts/install.sh release-assets/install.sh
+          chmod +x release-assets/install.sh
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            release-assets/redis-manager-linux-amd64
+            release-assets/redis-manager-linux-amd64.tar.gz
+            release-assets/redis-manager-linux-arm64
+            release-assets/redis-manager-linux-arm64.tar.gz
+            release-assets/install.sh
+            release-assets/checksums.txt
+          generate_release_notes: true

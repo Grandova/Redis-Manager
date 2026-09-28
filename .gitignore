@@ -1,0 +1,25 @@
+# Binaries and executables
+/redis-manager
+/redis-manager.exe
+/redis-manager-linux-*
+/bin/
+*.tar.gz
+*.sha256
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Runtime data & certificates
+/data/
+/logs/
+etc/
+*.db
+*.bak
+*.rdb
+
+# OS & Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

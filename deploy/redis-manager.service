@@ -1,0 +1,19 @@
+[Unit]
+Description=Redis Manager - Modern Web Redis Server & Browser
+After=network.target network-online.target systemd-sysctl.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/var/lib/redis-manager
+ExecStart=/usr/local/bin/redis-manager server
+Restart=always
+RestartSec=5s
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
