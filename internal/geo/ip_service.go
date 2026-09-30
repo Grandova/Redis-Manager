@@ -45,6 +45,11 @@ var (
 	onceIPService   sync.Once
 )
 
+func isUnresolved(prov string) bool {
+	prov = strings.TrimSpace(prov)
+	return prov == "" || prov == "待定位" || prov == "待定位省" || prov == "解析中" || prov == "待解析" || prov == "未知" || prov == "未知地区" || prov == "未知省" || strings.Contains(prov, "待定位")
+}
+
 func InitIPService(db *gorm.DB) *IPService {
 	onceIPService.Do(func() {
 		GlobalIPService = &IPService{
@@ -56,13 +61,13 @@ func InitIPService(db *gorm.DB) *IPService {
 		// Preload cache from DB
 		if db != nil {
 			// Purge any stale placeholders or invalid provinces from previous versions
-			_ = db.Where("prov IN (?) OR prov LIKE ?", []string{"待定位", "待定位省", "解析中", "未知省"}, "%待定位%").Delete(&database.IPGeoCache{}).Error
+			_ = db.Where("prov IN (?) OR prov LIKE ?", []string{"待定位", "待定位省", "解析中", "未知省", "未知地区", "未知", "待解析"}, "%待定位%").Delete(&database.IPGeoCache{}).Error
 
 			var caches []database.IPGeoCache
 			if err := db.Find(&caches).Error; err == nil {
 				for i := range caches {
 					item := caches[i]
-					if item.Prov == "待定位" || item.Prov == "解析中" || strings.Contains(item.Prov, "待定位") || item.Prov == "未知省" {
+					if isUnresolved(item.Prov) {
 						continue
 					}
 					GlobalIPService.memCache.Store(item.IP, &item)
@@ -71,6 +76,21 @@ func InitIPService(db *gorm.DB) *IPService {
 		}
 	})
 	return GlobalIPService
+}
+
+// PurgeUnresolvedCache evicts all failed/placeholder cache entries so they can be re-resolved
+func (s *IPService) PurgeUnresolvedCache() {
+	s.memCache.Range(func(key, value interface{}) bool {
+		if rec, ok := value.(*database.IPGeoCache); ok {
+			if isUnresolved(rec.Prov) {
+				s.memCache.Delete(key)
+			}
+		}
+		return true
+	})
+	if s.db != nil {
+		_ = s.db.Where("prov IN (?) OR prov LIKE ?", []string{"待定位", "待定位省", "解析中", "未知省", "未知地区", "未知", "待解析"}, "%待定位%").Delete(&database.IPGeoCache{}).Error
+	}
 }
 
 // IsPrivateIP checks if an IP is a local/private address
@@ -125,11 +145,8 @@ var chinaProvincesMap = map[string]string{
 // NormalizeProvince standardizes province names, preventing invalid '未知省' or '美国省'
 func NormalizeProvince(prov string) string {
 	prov = strings.TrimSpace(prov)
-	if prov == "" || prov == "未知" || prov == "未知省" {
-		return "未知地区"
-	}
-	if prov == "待定位" || prov == "待定位省" || prov == "解析中" {
-		return "待定位"
+	if isUnresolved(prov) {
+		return "待解析"
 	}
 	if prov == "局域网" || prov == "内网" {
 		return "局域网"
@@ -162,7 +179,7 @@ func GetRegionByProvince(prov string) string {
 	if prov == "局域网" || prov == "内网" {
 		return "局域网"
 	}
-	if prov == "待定位" || prov == "解析中" || prov == "未知" || prov == "未知地区" || prov == "" {
+	if isUnresolved(prov) {
 		return "其他地区"
 	}
 
@@ -203,16 +220,27 @@ type IP9ResponseRaw struct {
 	Qt   float64         `json:"qt"`
 }
 
-type IPAPIResponse struct {
-	Status     string `json:"status"`
-	Country    string `json:"country"`
-	CountryCode string `json:"countryCode"`
-	RegionName string `json:"regionName"`
-	City       string `json:"city"`
-	ISP        string `json:"isp"`
+type IPWhoIsResponse struct {
+	Success     bool   `json:"success"`
+	Country     string `json:"country"`
+	CountryCode string `json:"country_code"`
+	Region      string `json:"region"`
+	City        string `json:"city"`
+	Connection  struct {
+		ISP string `json:"isp"`
+	} `json:"connection"`
 }
 
-// Lookup retrieves geolocation for a single IP with primary and fallback providers
+type IPAPIResponse struct {
+	Status      string `json:"status"`
+	Country     string `json:"country"`
+	CountryCode string `json:"countryCode"`
+	RegionName  string `json:"regionName"`
+	City        string `json:"city"`
+	ISP         string `json:"isp"`
+}
+
+// Lookup retrieves geolocation for a single IP with multi-provider fallback
 func (s *IPService) Lookup(ctx context.Context, rawIP string) (*database.IPGeoCache, error) {
 	ip := CleanIP(rawIP)
 	if ip == "" {
@@ -222,7 +250,7 @@ func (s *IPService) Lookup(ctx context.Context, rawIP string) (*database.IPGeoCa
 	// 1. Check in-memory cache
 	if val, ok := s.memCache.Load(ip); ok {
 		cached := val.(*database.IPGeoCache)
-		if cached.Prov != "待定位" && cached.Prov != "解析中" && !strings.Contains(cached.Prov, "待定位") && cached.Prov != "未知省" {
+		if !isUnresolved(cached.Prov) {
 			return cached, nil
 		}
 	}
@@ -245,26 +273,52 @@ func (s *IPService) Lookup(ctx context.Context, rawIP string) (*database.IPGeoCa
 	var country, countryCode, prov, city, isp string
 	resolved := false
 
-	// 3. Primary provider: https://ip9.com.cn/get?ip=
-	reqURL := fmt.Sprintf("https://ip9.com.cn/get?ip=%s", ip)
-	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
-	if err == nil {
-		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-		req.Header.Set("Accept", "application/json")
-		resp, errDo := s.httpClient.Do(req)
-		if errDo == nil {
-			defer resp.Body.Close()
-			bodyBytes, errRead := io.ReadAll(resp.Body)
-			if errRead == nil {
-				var rawRes IP9ResponseRaw
-				if json.Unmarshal(bodyBytes, &rawRes) == nil && rawRes.Ret == 200 && len(rawRes.Data) > 0 && rawRes.Data[0] == '{' {
-					var data IP9Data
-					if json.Unmarshal(rawRes.Data, &data) == nil {
-						country = strings.TrimSpace(data.Country)
-						countryCode = strings.TrimSpace(data.CountryCode)
-						prov = strings.TrimSpace(data.Prov)
-						city = strings.TrimSpace(data.City)
-						isp = strings.TrimSpace(data.ISP)
+	// 3. Provider 1: https://ip9.com.cn/get?ip=
+	reqURL1 := fmt.Sprintf("https://ip9.com.cn/get?ip=%s", ip)
+	req1, err1 := http.NewRequestWithContext(ctx, "GET", reqURL1, nil)
+	if err1 == nil {
+		req1.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+		req1.Header.Set("Accept", "application/json")
+		resp1, errDo1 := s.httpClient.Do(req1)
+		if errDo1 == nil {
+			defer resp1.Body.Close()
+			if resp1.StatusCode == 200 {
+				bodyBytes, errRead := io.ReadAll(resp1.Body)
+				if errRead == nil {
+					var rawRes IP9ResponseRaw
+					if json.Unmarshal(bodyBytes, &rawRes) == nil && rawRes.Ret == 200 && len(rawRes.Data) > 0 && rawRes.Data[0] == '{' {
+						var data IP9Data
+						if json.Unmarshal(rawRes.Data, &data) == nil && (data.Country != "" || data.Prov != "") {
+							country = strings.TrimSpace(data.Country)
+							countryCode = strings.TrimSpace(data.CountryCode)
+							prov = strings.TrimSpace(data.Prov)
+							city = strings.TrimSpace(data.City)
+							isp = strings.TrimSpace(data.ISP)
+							resolved = true
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// 4. Provider 2 (High Speed, Zero Rate Limit): https://ipwho.is/{ip}?lang=zh-CN
+	if !resolved {
+		reqURL2 := fmt.Sprintf("https://ipwho.is/%s?lang=zh-CN", ip)
+		req2, err2 := http.NewRequestWithContext(ctx, "GET", reqURL2, nil)
+		if err2 == nil {
+			req2.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+			resp2, errDo2 := s.httpClient.Do(req2)
+			if errDo2 == nil {
+				defer resp2.Body.Close()
+				if resp2.StatusCode == 200 {
+					var whoisRes IPWhoIsResponse
+					if json.NewDecoder(resp2.Body).Decode(&whoisRes) == nil && whoisRes.Success && whoisRes.Country != "" {
+						country = strings.TrimSpace(whoisRes.Country)
+						countryCode = strings.TrimSpace(whoisRes.CountryCode)
+						prov = strings.TrimSpace(whoisRes.Region)
+						city = strings.TrimSpace(whoisRes.City)
+						isp = strings.TrimSpace(whoisRes.Connection.ISP)
 						resolved = true
 					}
 				}
@@ -272,7 +326,7 @@ func (s *IPService) Lookup(ctx context.Context, rawIP string) (*database.IPGeoCa
 		}
 	}
 
-	// 4. Secondary fallback: http://ip-api.com/json/{ip}?lang=zh-CN
+	// 5. Provider 3 (Secondary Fallback): http://ip-api.com/json/{ip}?lang=zh-CN
 	if !resolved {
 		fallbackURL := fmt.Sprintf("http://ip-api.com/json/%s?lang=zh-CN", ip)
 		reqFb, errFb := http.NewRequestWithContext(ctx, "GET", fallbackURL, nil)
@@ -281,23 +335,24 @@ func (s *IPService) Lookup(ctx context.Context, rawIP string) (*database.IPGeoCa
 			respFb, errDoFb := s.httpClient.Do(reqFb)
 			if errDoFb == nil {
 				defer respFb.Body.Close()
-				var fb IPAPIResponse
-				if json.NewDecoder(respFb.Body).Decode(&fb) == nil && fb.Status == "success" {
-					country = strings.TrimSpace(fb.Country)
-					countryCode = strings.TrimSpace(fb.CountryCode)
-					prov = strings.TrimSpace(fb.RegionName)
-					city = strings.TrimSpace(fb.City)
-					isp = strings.TrimSpace(fb.ISP)
-					resolved = true
+				if respFb.StatusCode == 200 {
+					var fb IPAPIResponse
+					if json.NewDecoder(respFb.Body).Decode(&fb) == nil && fb.Status == "success" {
+						country = strings.TrimSpace(fb.Country)
+						countryCode = strings.TrimSpace(fb.CountryCode)
+						prov = strings.TrimSpace(fb.RegionName)
+						city = strings.TrimSpace(fb.City)
+						isp = strings.TrimSpace(fb.ISP)
+						resolved = true
+					}
 				}
 			}
 		}
 	}
 
 	if !resolved {
-		// Both providers failed or IP is unresolvable
-		country = "未知"
-		prov = "未知地区"
+		// Do not cache failures permanently so subsequent calls can retry
+		return nil, fmt.Errorf("ip %s resolution failed on all providers", ip)
 	}
 
 	// Format country and province
@@ -311,7 +366,7 @@ func (s *IPService) Lookup(ctx context.Context, rawIP string) (*database.IPGeoCa
 			prov = country
 		}
 	} else if prov == "" {
-		prov = "未知地区"
+		prov = "待解析"
 	}
 
 	rec := &database.IPGeoCache{
@@ -324,11 +379,11 @@ func (s *IPService) Lookup(ctx context.Context, rawIP string) (*database.IPGeoCa
 		UpdatedAt:   time.Now(),
 	}
 
-	// Store in memory cache
+	// Store successfully resolved IP in memory cache
 	s.memCache.Store(ip, rec)
 
 	// Persist to database asynchronously
-	if s.db != nil && resolved {
+	if s.db != nil {
 		go func(r database.IPGeoCache) {
 			_ = s.db.Save(&r).Error
 		}(*rec)
@@ -352,7 +407,7 @@ func (s *IPService) LookupBatch(ctx context.Context, ips []string) map[string]*d
 
 		if val, ok := s.memCache.Load(clean); ok {
 			cached := val.(*database.IPGeoCache)
-			if cached.Prov != "待定位" && cached.Prov != "解析中" && !strings.Contains(cached.Prov, "待定位") && cached.Prov != "未知省" {
+			if !isUnresolved(cached.Prov) {
 				results[clean] = cached
 				continue
 			}
@@ -389,11 +444,11 @@ func (s *IPService) LookupBatch(ctx context.Context, ips []string) map[string]*d
 	// Concurrently resolve missing IPs in real time
 	if len(uniqueMissing) > 0 {
 		var wg sync.WaitGroup
-		sem := make(chan struct{}, 20) // up to 20 concurrent HTTP requests
+		sem := make(chan struct{}, 15) // up to 15 concurrent HTTP requests
 		var mu sync.Mutex
 
-		// Give batch lookup up to 3.5s
-		batchCtx, cancel := context.WithTimeout(ctx, 3500*time.Millisecond)
+		// Give batch lookup up to 4.5s
+		batchCtx, cancel := context.WithTimeout(ctx, 4500*time.Millisecond)
 		defer cancel()
 
 		for _, targetIP := range uniqueMissing {
@@ -413,12 +468,12 @@ func (s *IPService) LookupBatch(ctx context.Context, ips []string) map[string]*d
 				if err == nil && rec != nil {
 					results[ip] = rec
 				} else {
-					// Fallback placeholder so caller always has an entry
+					// Runtime-only fallback placeholder (never cached into memCache or DB)
 					results[ip] = &database.IPGeoCache{
 						IP:          ip,
-						Country:     "未知",
+						Country:     "中国",
 						CountryCode: "",
-						Prov:        "未知地区",
+						Prov:        "待解析",
 						City:        "",
 						ISP:         "",
 						UpdatedAt:   time.Now(),

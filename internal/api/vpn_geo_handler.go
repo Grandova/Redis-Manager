@@ -122,6 +122,8 @@ func (h *VPNGeoHandler) GetVPNGeoStats(c *gin.Context) {
 			return
 		}
 		h.mu.RUnlock()
+	} else {
+		h.ipService.PurgeUnresolvedCache()
 	}
 
 	client, err := h.getClient(dbIdx)
