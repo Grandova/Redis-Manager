@@ -128,7 +128,7 @@ export const aclApi = {
 };
 
 export const analyticsApi = {
-  getVPNGeo: (db = 0, pattern = 'soga_conn_*'): Promise<VPNGeoSummary> =>
-    request.get(`/redis/analytics/vpn-geo?db=${db}&pattern=${encodeURIComponent(pattern)}`),
+  getVPNGeo: (db = 0, pattern = 'soga_conn_*', refresh = false): Promise<VPNGeoSummary> =>
+    request.get(`/redis/analytics/vpn-geo?db=${db}&pattern=${encodeURIComponent(pattern)}${refresh ? '&refresh=true' : ''}`),
 };
 

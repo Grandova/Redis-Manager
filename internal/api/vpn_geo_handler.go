@@ -112,15 +112,17 @@ func (h *VPNGeoHandler) GetVPNGeoStats(c *gin.Context) {
 		pattern = "soga_conn_*"
 	}
 
-	// 0. Cache check (2.5s window) to eliminate Redis load on rapid menu switching
+	forceRefresh := c.Query("refresh") == "true" || c.Query("refresh") == "1"
 	cacheKey := fmt.Sprintf("%d:%s", dbIdx, pattern)
-	h.mu.RLock()
-	if item, found := h.cache[cacheKey]; found && time.Since(item.timestamp) < 2500*time.Millisecond {
+	if !forceRefresh {
+		h.mu.RLock()
+		if item, found := h.cache[cacheKey]; found && time.Since(item.timestamp) < 2500*time.Millisecond {
+			h.mu.RUnlock()
+			Success(c, item.data)
+			return
+		}
 		h.mu.RUnlock()
-		Success(c, item.data)
-		return
 	}
-	h.mu.RUnlock()
 
 	client, err := h.getClient(dbIdx)
 	if err != nil {
@@ -128,7 +130,7 @@ func (h *VPNGeoHandler) GetVPNGeoStats(c *gin.Context) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 6*time.Second)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 8*time.Second)
 	defer cancel()
 
 	// 1. Scan all matching keys
@@ -179,6 +181,7 @@ func (h *VPNGeoHandler) GetVPNGeoStats(c *gin.Context) {
 		UserID   string
 		Key      string
 		IP       string
+		RawIP    string
 		RawValue string
 		TTL      int64
 	}
@@ -239,9 +242,17 @@ func (h *VPNGeoHandler) GetVPNGeoStats(c *gin.Context) {
 			if trimmedIP == "" {
 				continue
 			}
+			cleanIP := geo.CleanIP(trimmedIP)
+			if cleanIP == "" {
+				cleanIP = trimmedIP
+			}
+			uniqueIPMap[cleanIP] = struct{}{}
 			uniqueIPMap[trimmedIP] = struct{}{}
 
 			fTTL := fieldTTLs[trimmedIP]
+			if fTTL == 0 {
+				fTTL = fieldTTLs[cleanIP]
+			}
 			// Fallback: check if value is a timestamp or heartbeat
 			if fTTL == 0 {
 				if valInt, err := strconv.ParseInt(rawVal, 10, 64); err == nil {
@@ -258,14 +269,15 @@ func (h *VPNGeoHandler) GetVPNGeoStats(c *gin.Context) {
 			rawNodes = append(rawNodes, RawNode{
 				UserID:   uid,
 				Key:      k,
-				IP:       trimmedIP,
+				IP:       cleanIP,
+				RawIP:    trimmedIP,
 				RawValue: rawVal,
 				TTL:      fTTL,
 			})
 		}
 	}
 
-	// 3. Batch resolve IP geolocations
+	// 3. Batch resolve IP geolocations in real time concurrently
 	uniqueIPList := make([]string, 0, len(uniqueIPMap))
 	for ip := range uniqueIPMap {
 		uniqueIPList = append(uniqueIPList, ip)
@@ -281,7 +293,11 @@ func (h *VPNGeoHandler) GetVPNGeoStats(c *gin.Context) {
 
 	for _, rn := range rawNodes {
 		geoInfo := geoMap[rn.IP]
-		prov := "未知"
+		if geoInfo == nil {
+			geoInfo = geoMap[rn.RawIP]
+		}
+
+		prov := "未知地区"
 		city := ""
 		isp := ""
 		country := "中国"
@@ -298,11 +314,16 @@ func (h *VPNGeoHandler) GetVPNGeoStats(c *gin.Context) {
 		}
 
 		stdProvName := geo.NormalizeProvince(prov)
+		regionName := geo.GetRegionByProvince(stdProvName)
+
 		if prov == "局域网" || geo.IsPrivateIP(rn.IP) {
 			lanCount++
 			stdProvName = "局域网"
+			regionName = "局域网"
 		} else if country != "中国" && country != "" && !strings.Contains(country, "中国") {
 			foreignCount++
+			stdProvName = country
+			regionName = "海外地区"
 		}
 
 		nodeInfo := VPNNodeInfo{
@@ -326,7 +347,7 @@ func (h *VPNGeoHandler) GetVPNGeoStats(c *gin.Context) {
 			pStat = &ProvinceStat{
 				Name:   stdProvName,
 				Prov:   prov,
-				Region: geo.GetRegionByProvince(stdProvName),
+				Region: regionName,
 				Count:  0,
 			}
 			provinceMap[stdProvName] = pStat
@@ -357,8 +378,8 @@ func (h *VPNGeoHandler) GetVPNGeoStats(c *gin.Context) {
 		return provinceList[i].Count > provinceList[j].Count
 	})
 
-	// Group into 7 Great Regions of China
-	regionNames := []string{"华东地区", "华南地区", "华中地区", "华北地区", "西南地区", "西北地区", "东北地区", "港澳台", "其他地区"}
+	// Group into 7 Great Regions + 港澳台 + 海外地区 + 局域网 + 其他地区
+	regionNames := []string{"华东地区", "华南地区", "华中地区", "华北地区", "西南地区", "西北地区", "东北地区", "港澳台", "海外地区", "局域网", "其他地区"}
 	regionMap := make(map[string]*RegionStat)
 	for _, rName := range regionNames {
 		regionMap[rName] = &RegionStat{
@@ -393,10 +414,16 @@ func (h *VPNGeoHandler) GetVPNGeoStats(c *gin.Context) {
 		return nodes[i].UserID < nodes[j].UserID
 	})
 
+	// Deduplicate unique IPs count
+	cleanIPSet := make(map[string]struct{})
+	for _, rn := range rawNodes {
+		cleanIPSet[rn.IP] = struct{}{}
+	}
+
 	summary := VPNGeoSummary{
 		TotalUsers:       len(userSet),
 		TotalConnections: totalConnections,
-		TotalIPs:         len(uniqueIPList),
+		TotalIPs:         len(cleanIPSet),
 		TotalProvinces:   len(provinceList),
 		ForeignCount:     foreignCount,
 		LanCount:         lanCount,

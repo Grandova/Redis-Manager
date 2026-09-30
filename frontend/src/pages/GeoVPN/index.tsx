@@ -94,12 +94,12 @@ export const GeoVPN: React.FC = () => {
   });
   const [form] = Form.useForm();
 
-  const fetchData = async (isBackground = false) => {
+  const fetchData = async (isBackground = false, forceRefresh = false) => {
     if (!isBackground && !data) {
       setLoading(true);
     }
     try {
-      const res = await analyticsApi.getVPNGeo(dbIdx, pattern);
+      const res = await analyticsApi.getVPNGeo(dbIdx, pattern, forceRefresh);
       cachedVPNData = res;
       cachedVPNDB = dbIdx;
       cachedVPNPattern = pattern;
@@ -122,7 +122,7 @@ export const GeoVPN: React.FC = () => {
 
   useEffect(() => {
     if (refreshInterval > 0) {
-      timerRef.current = setInterval(fetchData, refreshInterval * 1000);
+      timerRef.current = setInterval(() => fetchData(true), refreshInterval * 1000);
     } else if (timerRef.current) {
       clearInterval(timerRef.current);
       timerRef.current = null;
@@ -144,17 +144,27 @@ export const GeoVPN: React.FC = () => {
     message.success('阈值设置已保存');
   };
 
-  // Build ECharts series data
-  const mapData = (data?.provinces || []).map((p) => ({
-    name: p.name,
-    value: p.count,
-    prov: p.prov,
-    region: p.region,
-    ips: p.ips,
-    users: p.users,
-    cities: p.cities,
-    isps: p.isps,
-  }));
+  // Provinces displayed in the right ranking table based on active tab
+  const displayedProvinces = (data?.provinces || []).filter((p) => {
+    if (activeGeoTab === 'china') {
+      return p.region !== '海外地区' && p.region !== '局域网';
+    }
+    return true;
+  });
+
+  // Build ECharts series data (China map only colors valid Chinese provinces)
+  const mapData = (data?.provinces || [])
+    .filter((p) => p.region !== '海外地区' && p.region !== '局域网' && p.name !== '未知地区')
+    .map((p) => ({
+      name: p.name,
+      value: p.count,
+      prov: p.prov,
+      region: p.region,
+      ips: p.ips,
+      users: p.users,
+      cities: p.cities,
+      isps: p.isps,
+    }));
 
   const getMapOption = () => {
     return {
@@ -265,6 +275,9 @@ export const GeoVPN: React.FC = () => {
 
   // Filtered nodes list
   const filteredNodes = (data?.nodes || []).filter((n) => {
+    if (activeGeoTab === 'china' && (n.province === '海外地区' || (n.country && n.country !== '中国' && !n.country.includes('中国')))) {
+      return false;
+    }
     if (selectedProvince && n.province !== selectedProvince) {
       return false;
     }
@@ -275,7 +288,8 @@ export const GeoVPN: React.FC = () => {
         n.ip.toLowerCase().includes(q) ||
         n.prov.toLowerCase().includes(q) ||
         n.city.toLowerCase().includes(q) ||
-        n.isp.toLowerCase().includes(q)
+        n.isp.toLowerCase().includes(q) ||
+        (n.country && n.country.toLowerCase().includes(q))
       );
     }
     return true;
@@ -330,7 +344,7 @@ export const GeoVPN: React.FC = () => {
                 placeholder="键名通配符 (如: soga_conn_*)"
                 value={pattern}
                 onChange={(e) => setPattern(e.target.value)}
-                onPressEnter={() => fetchData(false)}
+                onPressEnter={() => fetchData(false, true)}
                 style={{ width: '180px' }}
               />
             </Space>
@@ -352,7 +366,7 @@ export const GeoVPN: React.FC = () => {
 
             <Button
               icon={<ReloadOutlined spin={loading} />}
-              onClick={() => fetchData(false)}
+              onClick={() => fetchData(false, true)}
               type="primary"
               style={{ backgroundColor: '#ef4444', borderColor: '#ef4444' }}
             >
@@ -469,13 +483,13 @@ export const GeoVPN: React.FC = () => {
                   label: (
                     <Space>
                       <span>省份连接排名</span>
-                      <Badge count={data?.provinces?.length || 0} overflowCount={999} style={{ backgroundColor: '#ef4444' }} />
+                      <Badge count={displayedProvinces.length} overflowCount={999} style={{ backgroundColor: '#ef4444' }} />
                     </Space>
                   ),
                   children: (
                     <div style={{ height: '560px', overflowY: 'auto' }}>
                       <Table
-                        dataSource={data?.provinces || []}
+                        dataSource={displayedProvinces}
                         rowKey="name"
                         size="small"
                         pagination={false}
@@ -504,24 +518,43 @@ export const GeoVPN: React.FC = () => {
                             ),
                           },
                           {
-                            title: '省份',
+                            title: '省份 / 地区',
                             dataIndex: 'name',
                             key: 'name',
-                            render: (name: string, record: ProvinceStat) => (
-                              <span
-                                style={{
-                                  fontWeight: 600,
-                                  cursor: 'pointer',
-                                  color: selectedProvince === name ? '#ef4444' : '#1e293b',
-                                }}
-                                onClick={() => setSelectedProvince(selectedProvince === name ? '' : name)}
-                              >
-                                {name}
-                                <span style={{ marginLeft: '4px', fontSize: '11px', color: '#94a3b8' }}>
-                                  ({record.region})
+                            render: (name: string, record: ProvinceStat) => {
+                              const isForeign = record.region === '海外地区';
+                              const isLan = record.region === '局域网';
+                              const isUnknown = record.name === '未知地区' || record.name === '其他地区';
+                              return (
+                                <span
+                                  style={{
+                                    fontWeight: 600,
+                                    cursor: 'pointer',
+                                    color: selectedProvince === name ? '#ef4444' : '#1e293b',
+                                  }}
+                                  onClick={() => setSelectedProvince(selectedProvince === name ? '' : name)}
+                                >
+                                  {name}
+                                  {isForeign ? (
+                                    <Tag color="geekblue" style={{ marginLeft: '6px', fontSize: '10px' }}>
+                                      海外地区
+                                    </Tag>
+                                  ) : isLan ? (
+                                    <Tag color="default" style={{ marginLeft: '6px', fontSize: '10px' }}>
+                                      局域网
+                                    </Tag>
+                                  ) : isUnknown ? (
+                                    <Tag color="orange" style={{ marginLeft: '6px', fontSize: '10px' }}>
+                                      待解析
+                                    </Tag>
+                                  ) : (
+                                    <span style={{ marginLeft: '4px', fontSize: '11px', color: '#94a3b8' }}>
+                                      ({record.region})
+                                    </span>
+                                  )}
                                 </span>
-                              </span>
-                            ),
+                              );
+                            },
                           },
                           {
                             title: '连接数',
@@ -649,12 +682,27 @@ export const GeoVPN: React.FC = () => {
                             {
                               title: '地区归属',
                               key: 'geo',
-                              render: (_: any, r: VPNNodeInfo) => (
-                                <div>
-                                  <div style={{ fontWeight: 600 }}>{r.prov} {r.city ? `· ${r.city}` : ''}</div>
-                                  <div style={{ fontSize: '11px', color: '#94a3b8' }}>{r.isp || '未知网络'}</div>
-                                </div>
-                              ),
+                              render: (_: any, r: VPNNodeInfo) => {
+                                const isForeign = r.country && r.country !== '中国' && !r.country.includes('中国');
+                                const isLan = r.prov === '局域网';
+                                const isUnknown = r.prov === '未知地区' || r.prov === '未知' || r.prov === '待定位';
+                                return (
+                                  <div>
+                                    <div style={{ fontWeight: 600 }}>
+                                      {isForeign && <Tag color="geekblue" style={{ marginRight: '4px', fontSize: '11px' }}>海外</Tag>}
+                                      {isLan && <Tag color="default" style={{ marginRight: '4px', fontSize: '11px' }}>内网</Tag>}
+                                      {isUnknown ? (
+                                        <span style={{ color: '#94a3b8' }}>待解析 / 未知</span>
+                                      ) : (
+                                        <span>{r.prov} {r.city ? `· ${r.city}` : ''}</span>
+                                      )}
+                                    </div>
+                                    <div style={{ fontSize: '11px', color: '#94a3b8' }}>
+                                      {r.isp || (isForeign ? r.country : '未知网络')}
+                                    </div>
+                                  </div>
+                                );
+                              },
                             },
                             {
                               title: '剩余有效',
